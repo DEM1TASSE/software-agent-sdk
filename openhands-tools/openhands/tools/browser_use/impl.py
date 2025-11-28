@@ -94,6 +94,20 @@ def _ensure_chromium_available() -> str:
     Raises:
         Exception: If Chromium is not available
     """
+    # Highest priority: explicit override via env var
+    env_path = os.getenv("OPENHANDS_CHROMIUM_PATH")
+    if env_path:
+        candidate = Path(env_path).expanduser()
+        if candidate.exists():
+            logger.info(
+                "Using Chromium from OPENHANDS_CHROMIUM_PATH: %s", str(candidate)
+            )
+            return str(candidate)
+        else:
+            logger.warning(
+                "OPENHANDS_CHROMIUM_PATH is set but does not exist: %s", str(candidate)
+            )
+
     if path := _check_chromium_available():
         logger.info(f"Chromium is available for browser operations at {path}")
         return path
@@ -146,7 +160,24 @@ class BrowserToolExecutor(ToolExecutor[BrowserAction, BrowserObservation]):
 
         def init_logic():
             nonlocal headless
-            executable_path = _ensure_chromium_available()
+
+            # Allow skipping explicit executable_path and relying on browser-use defaults.
+            # This can be useful in environments where our manual Chromium detection
+            # interferes with browser-use's own launcher configuration.
+            skip_exec = os.getenv(
+                "OPENHANDS_BROWSER_USE_SKIP_EXECUTABLE", "false"
+            ).lower() in {"true", "1", "yes"}
+
+            executable_path: str | None = None
+            if not skip_exec:
+                executable_path = _ensure_chromium_available()
+            else:
+                logger.info(
+                    "OPENHANDS_BROWSER_USE_SKIP_EXECUTABLE is enabled - "
+                    "not setting executable_path and letting browser-use "
+                    "choose the browser binary."
+                )
+
             self._server = CustomBrowserUseServer(
                 session_timeout_minutes=session_timeout_minutes,
             )
@@ -154,12 +185,15 @@ class BrowserToolExecutor(ToolExecutor[BrowserAction, BrowserObservation]):
                 headless = False  # Force headless off if VNC is enabled
                 logger.info("VNC is enabled - running browser in non-headless mode")
 
-            self._config = {
+            base_config: dict[str, Any] = {
                 "headless": headless,
                 "allowed_domains": allowed_domains or [],
-                "executable_path": executable_path,
                 **config,
             }
+            if executable_path is not None:
+                base_config["executable_path"] = executable_path
+
+            self._config = base_config
 
         try:
             run_with_timeout(init_logic, init_timeout_seconds)
