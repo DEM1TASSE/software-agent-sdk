@@ -53,27 +53,30 @@ class CdpHarRecorder:
         self._cdp_client = cdp_client
         self._session_id = session_id
         
+        # Register event callbacks (global, once)
+        if not self._callback_registered:
+            # Note: cdp_use callbacks receive (event, session_id) as arguments
+            cdp_client.register.Network.requestWillBeSent(self._on_request_will_be_sent)
+            cdp_client.register.Network.responseReceived(self._on_response_received)
+            cdp_client.register.Network.loadingFinished(self._on_loading_finished)
+            cdp_client.register.Network.loadingFailed(self._on_loading_failed)
+            self._callback_registered = True
+            logger.info("[CdpHarRecorder] Registered network event callbacks")
+        
+        # Try to enable Network domain (may fail on root client, that's OK)
+        # browser-use enables it per-session anyway
         try:
-            # Register event callbacks (global, once)
-            if not self._callback_registered:
-                cdp_client.register.Network.requestWillBeSent(self._on_request_will_be_sent)
-                cdp_client.register.Network.responseReceived(self._on_response_received)
-                cdp_client.register.Network.loadingFinished(self._on_loading_finished)
-                cdp_client.register.Network.loadingFailed(self._on_loading_failed)
-                self._callback_registered = True
-                logger.info("[CdpHarRecorder] Registered network event callbacks")
-            
-            # Enable Network domain
             await cdp_client.send.Network.enable(session_id=session_id)
             logger.info(f"[CdpHarRecorder] Network domain enabled (session_id={session_id})")
-            
-            self._started = True
-            
         except Exception as e:
-            logger.error(f"[CdpHarRecorder] Failed to start: {e}")
-            raise
+            # Network.enable may fail on root client without session_id
+            # That's OK - the callbacks will still receive events from sessions that have it enabled
+            logger.debug(f"[CdpHarRecorder] Network.enable skipped (will use existing): {e}")
+        
+        self._started = True
+        logger.info(f"[CdpHarRecorder] Recording started, will save to: {self.har_path}")
     
-    def _on_request_will_be_sent(self, event: dict[str, Any]) -> None:
+    def _on_request_will_be_sent(self, event: dict[str, Any], session_id: Optional[str] = None) -> None:
         """Handle Network.requestWillBeSent event."""
         try:
             request_id = event.get("requestId")
@@ -140,7 +143,7 @@ class CdpHarRecorder:
         except Exception as e:
             logger.warning(f"[CdpHarRecorder] Error handling request: {e}")
     
-    def _on_response_received(self, event: dict[str, Any]) -> None:
+    def _on_response_received(self, event: dict[str, Any], session_id: Optional[str] = None) -> None:
         """Handle Network.responseReceived event."""
         try:
             request_id = event.get("requestId")
@@ -167,7 +170,7 @@ class CdpHarRecorder:
         except Exception as e:
             logger.warning(f"[CdpHarRecorder] Error handling response: {e}")
     
-    def _on_loading_finished(self, event: dict[str, Any]) -> None:
+    def _on_loading_finished(self, event: dict[str, Any], session_id: Optional[str] = None) -> None:
         """Handle Network.loadingFinished event."""
         try:
             request_id = event.get("requestId")
@@ -193,7 +196,7 @@ class CdpHarRecorder:
         except Exception as e:
             logger.warning(f"[CdpHarRecorder] Error handling loadingFinished: {e}")
     
-    def _on_loading_failed(self, event: dict[str, Any]) -> None:
+    def _on_loading_failed(self, event: dict[str, Any], session_id: Optional[str] = None) -> None:
         """Handle Network.loadingFailed event."""
         try:
             request_id = event.get("requestId")
