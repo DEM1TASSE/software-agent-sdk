@@ -551,6 +551,7 @@ class BrowserToolSet(ToolDefinition[BrowserAction, BrowserObservation]):
     The toolset automatically checks for Chromium availability
     when created and automatically installs it if missing.
     """
+    _last_executor = None
 
     @classmethod
     def create(
@@ -579,6 +580,8 @@ class BrowserToolSet(ToolDefinition[BrowserAction, BrowserObservation]):
                 full_output_save_dir=conv_state.env_observation_persistence_dir,
                 **executor_config,
             )
+
+        cls._last_executor = executor
 
         # Each tool.create() returns a Sequence[Self], so we flatten the results
         tools: list[ToolDefinition[BrowserAction, BrowserObservation]] = []

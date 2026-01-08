@@ -80,6 +80,7 @@ class BrowserToolExecutor(ToolExecutor[BrowserAction, BrowserObservation]):
     _initialized: bool
     _async_executor: AsyncExecutor
     _cleanup_initiated: bool
+    _har_recorder: "HarRecorder | None"
 
     def check_chromium_available(self) -> str | None:
         """Check if a Chromium/Chrome binary is available.
@@ -154,6 +155,7 @@ class BrowserToolExecutor(ToolExecutor[BrowserAction, BrowserObservation]):
         session_timeout_minutes: int = 30,
         init_timeout_seconds: int = 30,
         full_output_save_dir: str | None = None,
+        record_har_path: str | None = None,
         **config,
     ):
         """Initialize BrowserToolExecutor with timeout protection.
@@ -193,9 +195,11 @@ class BrowserToolExecutor(ToolExecutor[BrowserAction, BrowserObservation]):
             )
 
         self.full_output_save_dir: str | None = full_output_save_dir
+        self.record_har_path: str | None = record_har_path
         self._initialized = False
         self._async_executor = AsyncExecutor()
         self._cleanup_initiated = False
+        self._har_recorder = None
 
     def __call__(
         self,
@@ -276,12 +280,51 @@ class BrowserToolExecutor(ToolExecutor[BrowserAction, BrowserObservation]):
             # Initialize browser session with our config
             await self._server._init_browser_session(**self._config)
             self._initialized = True
+            
+            # Start HAR recording if path is specified
+            if self.record_har_path:
+                try:
+                    from openhands.tools.browser_use.har_recorder import HarRecorder
+                    cdp_url = self._server.browser_session.cdp_url
+                    if cdp_url:
+                        self._har_recorder = HarRecorder(self.record_har_path)
+                        await self._har_recorder.start(cdp_url)
+                        logger.info(f"HAR recording started: {self.record_har_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to start HAR recording: {e}")
+
+            # Monkey patch _close_browser to ensure HAR is saved before browser closes
+            # This handles cases where browser-use closes the browser automatically (e.g. on finish)
+            if not hasattr(self._server, "_original_close_browser"):
+                self._server._original_close_browser = self._server._close_browser
+                
+                async def patched_close_browser(*args, **kwargs):
+                    if self._har_recorder:
+                        try:
+                            # Stop recorder (saves HAR)
+                            har_path = await self._har_recorder.stop()
+                            logger.info(f"HAR recording saved via auto-close hook: {har_path}")
+                            self._har_recorder = None
+                        except Exception as e:
+                            logger.warning(f"Error saving HAR during auto-close: {e}")
+                    return await self._server._original_close_browser(*args, **kwargs)
+                
+                self._server._close_browser = patched_close_browser
 
     # Navigation & Browser Control Methods
     async def navigate(self, url: str, new_tab: bool = False) -> str:
         """Navigate to a URL."""
         await self._ensure_initialized()
-        return await self._server._navigate(url, new_tab)
+        result = await self._server._navigate(url, new_tab)
+        
+        # Mirror navigation to HAR recorder
+        if self._har_recorder:
+            try:
+                await self._har_recorder.navigate(url)
+            except Exception:
+                pass  # Best effort - don't fail navigation if HAR fails
+        
+        return result
 
     async def go_back(self) -> str:
         """Go back in browser history."""
@@ -369,6 +412,15 @@ class BrowserToolExecutor(ToolExecutor[BrowserAction, BrowserObservation]):
     async def cleanup(self):
         """Cleanup browser resources."""
         try:
+            # Stop HAR recording first (saves HAR file)
+            if self._har_recorder:
+                try:
+                    har_path = await self._har_recorder.stop()
+                    logger.info(f"HAR recording saved: {har_path}")
+                except Exception as e:
+                    logger.warning(f"Error stopping HAR recording: {e}")
+                self._har_recorder = None
+            
             await self.close_browser()
             if hasattr(self._server, "_close_all_sessions"):
                 await self._server._close_all_sessions()

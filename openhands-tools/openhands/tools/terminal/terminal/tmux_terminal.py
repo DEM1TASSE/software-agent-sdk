@@ -99,10 +99,17 @@ class TmuxTerminal(TerminalInterface):
             return
         try:
             if hasattr(self, "session"):
-                self.session.kill()
+                try:
+                    self.session.kill()
+                except libtmux.exc.LibTmuxException as e:
+                    # tmux server or session might already be gone; ignore and log
+                    logger.warning(f"Failed to kill tmux session cleanly: {e}")
         except ImportError:
             # Python is shutting down, let the OS handle cleanup
             pass
+        except Exception as e:
+            # Any other unexpected error during close should not crash the agent
+            logger.warning("Unexpected error while closing tmux terminal", exc_info=e)
         self._closed: bool = True
 
     def send_keys(self, text: str, enter: bool = True) -> None:
