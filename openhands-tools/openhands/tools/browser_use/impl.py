@@ -281,17 +281,33 @@ class BrowserToolExecutor(ToolExecutor[BrowserAction, BrowserObservation]):
             await self._server._init_browser_session(**self._config)
             self._initialized = True
             
-            # Start HAR recording if path is specified
+            # Start CDP-based HAR recording if path is specified
             if self.record_har_path:
                 try:
-                    from openhands.tools.browser_use.har_recorder import HarRecorder
-                    cdp_url = self._server.browser_session.cdp_url
-                    if cdp_url:
-                        self._har_recorder = HarRecorder(self.record_har_path)
-                        await self._har_recorder.start(cdp_url)
-                        logger.info(f"HAR recording started: {self.record_har_path}")
+                    from openhands.tools.browser_use.cdp_har_recorder import CdpHarRecorder
+                    
+                    # Get CDP client from browser session
+                    browser_session = self._server.browser_session
+                    if browser_session and hasattr(browser_session, '_cdp_client_root'):
+                        cdp_client = browser_session._cdp_client_root
+                        if cdp_client:
+                            self._har_recorder = CdpHarRecorder(self.record_har_path)
+                            # Get session ID for the current target if available
+                            session_id = None
+                            if hasattr(browser_session, 'session_manager') and browser_session.session_manager:
+                                active_session = browser_session.session_manager.active_cdp_session
+                                if active_session:
+                                    session_id = active_session.session_id
+                            await self._har_recorder.start(cdp_client, session_id)
+                            logger.info(f"CDP HAR recording started: {self.record_har_path}")
+                        else:
+                            logger.warning("CDP client not available for HAR recording")
+                    else:
+                        logger.warning("Browser session or CDP client not available for HAR recording")
                 except Exception as e:
-                    logger.warning(f"Failed to start HAR recording: {e}")
+                    logger.warning(f"Failed to start CDP HAR recording: {e}")
+                    import traceback
+                    traceback.print_exc()
 
             # Monkey patch _close_browser to ensure HAR is saved before browser closes
             # This handles cases where browser-use closes the browser automatically (e.g. on finish)
@@ -316,14 +332,7 @@ class BrowserToolExecutor(ToolExecutor[BrowserAction, BrowserObservation]):
         """Navigate to a URL."""
         await self._ensure_initialized()
         result = await self._server._navigate(url, new_tab)
-        
-        # Mirror navigation to HAR recorder
-        if self._har_recorder:
-            try:
-                await self._har_recorder.navigate(url)
-            except Exception:
-                pass  # Best effort - don't fail navigation if HAR fails
-        
+        # Note: No need to mirror navigation anymore - CdpHarRecorder captures all network events
         return result
 
     async def go_back(self) -> str:
