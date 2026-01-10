@@ -292,8 +292,8 @@ class BrowserToolExecutor(ToolExecutor[BrowserAction, BrowserObservation]):
                         cdp_client = browser_session._cdp_client_root
                         if cdp_client:
                             self._har_recorder = CdpHarRecorder(self.record_har_path)
-                            # Start without session_id - Network.enable on root client captures all traffic
-                            await self._har_recorder.start(cdp_client, session_id=None)
+                            # Pass browser_session to enable Network on existing sessions
+                            await self._har_recorder.start(cdp_client, browser_session=browser_session)
                             logger.info(f"CDP HAR recording started: {self.record_har_path}")
                         else:
                             logger.warning("CDP client not available for HAR recording")

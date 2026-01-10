@@ -40,18 +40,23 @@ class CdpHarRecorder:
         self._entries: list[dict[str, Any]] = []
         self._pending_requests: dict[str, dict[str, Any]] = {}
     
-    async def start(self, cdp_client: Any, session_id: Optional[str] = None) -> None:
+    async def start(self, cdp_client: Any, browser_session: Any = None, session_id: Optional[str] = None) -> None:
         """Start recording network traffic via CDP.
         
         Args:
             cdp_client: CDPClient instance from browser-use/cdp_use
+            browser_session: BrowserSession instance to access existing CDP sessions
             session_id: Optional CDP session ID for target-specific recording
         """
         if self._started:
             return
         
         self._cdp_client = cdp_client
+        self._browser_session = browser_session
         self._session_id = session_id
+        
+        # Track sessions we've enabled Network for
+        self._enabled_sessions: set[str] = set()
         
         # Register event callbacks (global, once)
         if not self._callback_registered:
@@ -60,21 +65,62 @@ class CdpHarRecorder:
             cdp_client.register.Network.responseReceived(self._on_response_received)
             cdp_client.register.Network.loadingFinished(self._on_loading_finished)
             cdp_client.register.Network.loadingFailed(self._on_loading_failed)
+            
+            # Subscribe to Target.attachedToTarget to enable Network for future sessions
+            cdp_client.register.Target.attachedToTarget(self._on_target_attached)
+            
             self._callback_registered = True
-            logger.info("[CdpHarRecorder] Registered network event callbacks")
+            logger.info("[CdpHarRecorder] Registered network and target event callbacks")
         
-        # Try to enable Network domain (may fail on root client, that's OK)
-        # browser-use enables it per-session anyway
+        # Enable Network for existing sessions from browser_session
+        if browser_session and hasattr(browser_session, 'session_manager') and browser_session.session_manager:
+            session_manager = browser_session.session_manager
+            # SessionManager uses _sessions as internal dict
+            if hasattr(session_manager, '_sessions') and session_manager._sessions:
+                for sid, cdp_session in session_manager._sessions.items():
+                    if sid not in self._enabled_sessions:
+                        try:
+                            await cdp_client.send.Network.enable(session_id=sid)
+                            self._enabled_sessions.add(sid)
+                            logger.info(f"[CdpHarRecorder] Network enabled for existing session {sid[:8]}...")
+                        except Exception as e:
+                            logger.debug(f"[CdpHarRecorder] Failed to enable Network for session {sid[:8]}...: {e}")
+        
+        # Also try root level (may fail, that's OK)
         try:
             await cdp_client.send.Network.enable(session_id=session_id)
-            logger.info(f"[CdpHarRecorder] Network domain enabled (session_id={session_id})")
+            logger.debug(f"[CdpHarRecorder] Network domain enabled on root")
         except Exception as e:
-            # Network.enable may fail on root client without session_id
-            # That's OK - the callbacks will still receive events from sessions that have it enabled
-            logger.debug(f"[CdpHarRecorder] Network.enable skipped (will use existing): {e}")
+            logger.debug(f"[CdpHarRecorder] Network.enable on root skipped: {e}")
         
         self._started = True
         logger.info(f"[CdpHarRecorder] Recording started, will save to: {self.har_path}")
+    
+    def _on_target_attached(self, event: dict[str, Any], session_id: Optional[str] = None) -> None:
+        """Handle Target.attachedToTarget event - enable Network domain for new sessions."""
+        try:
+            new_session_id = event.get("sessionId")
+            target_info = event.get("targetInfo", {})
+            target_type = target_info.get("type", "")
+            
+            # Only enable for page targets (not service workers, etc.)
+            if target_type == "page" and new_session_id and new_session_id not in self._enabled_sessions:
+                self._enabled_sessions.add(new_session_id)
+                # Schedule async enable (we're in sync callback)
+                import asyncio
+                asyncio.create_task(self._enable_network_for_session(new_session_id))
+                logger.debug(f"[CdpHarRecorder] Scheduled Network.enable for session {new_session_id[:8]}...")
+        except Exception as e:
+            logger.warning(f"[CdpHarRecorder] Error handling target attached: {e}")
+    
+    async def _enable_network_for_session(self, session_id: str) -> None:
+        """Enable Network domain for a specific session."""
+        try:
+            if self._cdp_client:
+                await self._cdp_client.send.Network.enable(session_id=session_id)
+                logger.info(f"[CdpHarRecorder] Network enabled for session {session_id[:8]}...")
+        except Exception as e:
+            logger.debug(f"[CdpHarRecorder] Failed to enable Network for session {session_id[:8]}...: {e}")
     
     def _on_request_will_be_sent(self, event: dict[str, Any], session_id: Optional[str] = None) -> None:
         """Handle Network.requestWillBeSent event."""
