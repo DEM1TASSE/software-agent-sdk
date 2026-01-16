@@ -138,6 +138,32 @@ class CdpHarRecorder:
             else:
                 started_dt = datetime.now(timezone.utc)
             
+            # Handle redirect response
+            # If redirectResponse is present, the previous request with the same ID is finished/redirected
+            redirect_response = event.get("redirectResponse")
+            if redirect_response and request_id in self._pending_requests:
+                redirect_entry = self._pending_requests[request_id]
+                
+                # Update redirect entry with response info
+                redirect_entry["response"]["status"] = redirect_response.get("status", 0)
+                redirect_entry["response"]["statusText"] = redirect_response.get("statusText", "")
+                redirect_entry["response"]["headers"] = self._format_headers(redirect_response.get("headers", {}))
+                redirect_entry["response"]["content"]["mimeType"] = redirect_response.get("mimeType", "")
+                redirect_entry["response"]["redirectURL"] = request.get("url", "") # The new URL is the redirect target
+                
+                # Calculate timing
+                timing = redirect_response.get("timing")
+                if timing:
+                    redirect_entry["timings"]["wait"] = timing.get("receiveHeadersEnd", 0) - timing.get("sendEnd", 0)
+                    
+                self._entries.append(redirect_entry)
+                
+                method = redirect_entry["request"]["method"]
+                if method != "GET":
+                    logger.info(f"[CdpHarRecorder] Redirected {method} [{request_id}] (saved to entries): {redirect_entry['request']['url'][:100]} -> {request.get('url', '')[:100]}")
+                else:
+                    logger.debug(f"[CdpHarRecorder] Redirected [{request_id}]: {redirect_entry['request']['url'][:80]} -> {request.get('url', '')[:80]}")
+            
             # Build request entry
             entry = {
                 "startedDateTime": started_dt.isoformat(),
@@ -184,88 +210,12 @@ class CdpHarRecorder:
                 }
             
             self._pending_requests[request_id] = entry
-            logger.debug(f"[CdpHarRecorder] Request: {request.get('method')} {request.get('url', '')[:80]}")
             
         except Exception as e:
             logger.warning(f"[CdpHarRecorder] Error handling request: {e}")
-    
-    def _on_response_received(self, event: dict[str, Any], session_id: Optional[str] = None) -> None:
-        """Handle Network.responseReceived event."""
-        try:
-            request_id = event.get("requestId")
-            response = event.get("response", {})
-            
-            if not request_id or request_id not in self._pending_requests:
-                return
-            
-            entry = self._pending_requests[request_id]
-            
-            # Update response info
-            entry["response"]["status"] = response.get("status", 0)
-            entry["response"]["statusText"] = response.get("statusText", "")
-            entry["response"]["headers"] = self._format_headers(response.get("headers", {}))
-            entry["response"]["content"]["mimeType"] = response.get("mimeType", "")
-            
-            # Calculate timing if available
-            timing = response.get("timing")
-            if timing:
-                entry["timings"]["wait"] = timing.get("receiveHeadersEnd", 0) - timing.get("sendEnd", 0)
-            
-            logger.debug(f"[CdpHarRecorder] Response: {response.get('status')} for {entry['request']['url'][:80]}")
-            
-        except Exception as e:
-            logger.warning(f"[CdpHarRecorder] Error handling response: {e}")
-    
-    def _on_loading_finished(self, event: dict[str, Any], session_id: Optional[str] = None) -> None:
-        """Handle Network.loadingFinished event."""
-        try:
-            request_id = event.get("requestId")
-            
-            if not request_id or request_id not in self._pending_requests:
-                return
-            
-            entry = self._pending_requests.pop(request_id)
-            
-            # Update content size
-            encoded_length = event.get("encodedDataLength", 0)
-            entry["response"]["content"]["size"] = encoded_length
-            entry["response"]["bodySize"] = encoded_length
-            
-            # Calculate total time
-            if "timestamp" in event:
-                # timestamp is relative to page load, not absolute
-                pass
-            
-            self._entries.append(entry)
-            logger.debug(f"[CdpHarRecorder] Completed: {entry['request']['url'][:80]}")
-            
-        except Exception as e:
-            logger.warning(f"[CdpHarRecorder] Error handling loadingFinished: {e}")
-    
-    def _on_loading_failed(self, event: dict[str, Any], session_id: Optional[str] = None) -> None:
-        """Handle Network.loadingFailed event."""
-        try:
-            request_id = event.get("requestId")
-            
-            if not request_id or request_id not in self._pending_requests:
-                return
-            
-            entry = self._pending_requests.pop(request_id)
-            
-            # Mark as failed
-            entry["response"]["status"] = 0
-            entry["response"]["statusText"] = event.get("errorText", "Failed")
-            
-            self._entries.append(entry)
-            logger.debug(f"[CdpHarRecorder] Failed: {entry['request']['url'][:80]}")
-            
-        except Exception as e:
-            logger.warning(f"[CdpHarRecorder] Error handling loadingFailed: {e}")
-    
-    def _format_headers(self, headers: dict[str, str]) -> list[dict[str, str]]:
-        """Convert headers dict to HAR format list."""
-        return [{"name": k, "value": v} for k, v in headers.items()]
-    
+
+# ... (omitted parts)
+
     async def stop(self) -> Path:
         """Stop recording and save HAR file.
         
@@ -292,6 +242,133 @@ class CdpHarRecorder:
             har = {
                 "log": {
                     "version": "1.2",
+                    "creator": {"name": "BrowserUse CDP HarRecorder", "version": "0.1"},
+                    "entries": self._entries,
+                }
+            }
+            
+            # Ensure directory exists
+            self.har_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Save to file
+            with self.har_path.open("w", encoding="utf-8") as f:
+                json.dump(har, f, indent=2, ensure_ascii=False)
+            
+            logger.info(f"[CdpHarRecorder] Saved {len(self._entries)} entries to {self.har_path}")
+            
+        except Exception as e:
+            logger.error(f"[CdpHarRecorder] Error saving HAR: {e}")
+        
+        return self.har_path
+    
+    def _on_response_received(self, event: dict[str, Any], session_id: Optional[str] = None) -> None:
+        """Handle Network.responseReceived event."""
+        try:
+            request_id = event.get("requestId")
+            response = event.get("response", {})
+            
+            if not request_id or request_id not in self._pending_requests:
+                return
+            
+            entry = self._pending_requests[request_id]
+            
+            # Update response info
+            entry["response"]["status"] = response.get("status", 0)
+            entry["response"]["statusText"] = response.get("statusText", "")
+            entry["response"]["headers"] = self._format_headers(response.get("headers", {}))
+            entry["response"]["content"]["mimeType"] = response.get("mimeType", "")
+            
+            # Calculate timing if available
+            timing = response.get("timing")
+            if timing:
+                entry["timings"]["wait"] = timing.get("receiveHeadersEnd", 0) - timing.get("sendEnd", 0)
+            
+        except Exception as e:
+            logger.warning(f"[CdpHarRecorder] Error handling response: {e}")
+    
+    def _on_loading_finished(self, event: dict[str, Any], session_id: Optional[str] = None) -> None:
+        """Handle Network.loadingFinished event."""
+        try:
+            request_id = event.get("requestId")
+            
+            if not request_id or request_id not in self._pending_requests:
+                return
+            
+            entry = self._pending_requests.pop(request_id)
+            
+            # Update content size
+            encoded_length = event.get("encodedDataLength", 0)
+            entry["response"]["content"]["size"] = encoded_length
+            entry["response"]["bodySize"] = encoded_length
+            
+            # Calculate total time
+            # timestamp is relative to page load, not absolute
+            pass
+            
+            self._entries.append(entry)
+            
+        except Exception as e:
+            logger.warning(f"[CdpHarRecorder] Error handling loadingFinished: {e}")
+    
+    def _on_loading_failed(self, event: dict[str, Any], session_id: Optional[str] = None) -> None:
+        """Handle Network.loadingFailed event."""
+        try:
+            request_id = event.get("requestId")
+            
+            if not request_id or request_id not in self._pending_requests:
+                return
+            
+            entry = self._pending_requests.pop(request_id)
+            
+            # Mark as failed
+            entry["response"]["status"] = 0
+            entry["response"]["statusText"] = event.get("errorText", "Failed")
+            
+            self._entries.append(entry)
+            
+        except Exception as e:
+            logger.warning(f"[CdpHarRecorder] Error handling loadingFailed: {e}")
+            
+        except Exception as e:
+            logger.warning(f"[CdpHarRecorder] Error handling loadingFailed: {e}")
+    
+    def _format_headers(self, headers: dict[str, str]) -> list[dict[str, str]]:
+        """Convert headers dict to HAR format list."""
+        return [{"name": k, "value": v} for k, v in headers.items()]
+    
+    async def stop(self) -> Path:
+        """Stop recording and save HAR file.
+        
+        Returns:
+            Path to the saved HAR file
+        """
+        if not self._started:
+            return self.har_path
+        
+        try:
+            # Disable Network domain
+            if self._cdp_client:
+                try:
+                    await self._cdp_client.send.Network.disable(session_id=self._session_id)
+                except Exception:
+                    pass  # Best effort
+            
+            # Move any remaining pending requests to entries
+            pending_count = len(self._pending_requests)
+            if pending_count > 0:
+                pending_methods = {}
+                for entry in self._pending_requests.values():
+                    m = entry.get("request", {}).get("method", "UNKNOWN")
+                    pending_methods[m] = pending_methods.get(m, 0) + 1
+                logger.info(f"[CdpHarRecorder] Moving {pending_count} pending requests to entries: {pending_methods}")
+            for entry in self._pending_requests.values():
+                self._entries.append(entry)
+            self._pending_requests.clear()
+            
+            # Build HAR structure
+            har = {
+                "log": {
+                    "version": "1.2",
                     "creator": {
                         "name": "CdpHarRecorder",
                         "version": "1.0",
@@ -304,7 +381,13 @@ class CdpHarRecorder:
             with self.har_path.open("w", encoding="utf-8") as f:
                 json.dump(har, f, indent=2, ensure_ascii=False)
             
+            # Log method distribution for debugging
+            methods = {}
+            for entry in self._entries:
+                m = entry.get("request", {}).get("method", "UNKNOWN")
+                methods[m] = methods.get(m, 0) + 1
             logger.info(f"[CdpHarRecorder] Saved {len(self._entries)} entries to {self.har_path}")
+            logger.info(f"[CdpHarRecorder] Methods: {methods}")
             
         except Exception as e:
             logger.error(f"[CdpHarRecorder] Error saving HAR: {e}")
