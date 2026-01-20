@@ -39,6 +39,8 @@ class CdpHarRecorder:
         # HAR data structures
         self._entries: list[dict[str, Any]] = []
         self._pending_requests: dict[str, dict[str, Any]] = {}
+        # Cache for extraInfo that arrives before requestWillBeSent
+        self._pending_extra_info: dict[str, dict[str, Any]] = {}
     
     async def start(self, cdp_client: Any, browser_session: Any = None, session_id: Optional[str] = None) -> None:
         """Start recording network traffic via CDP.
@@ -186,6 +188,20 @@ class CdpHarRecorder:
             
             self._pending_requests[request_id] = entry
             
+            # Check if we have cached extraInfo that arrived early
+            if request_id in self._pending_extra_info:
+                cached = self._pending_extra_info.pop(request_id)
+                extra_headers = cached.get("headers", {})
+                if extra_headers:
+                    logger.info(f"[CdpHarRecorder] Applying {len(extra_headers)} cached extra headers for {request.get('url', '')[:80]}")
+                    existing_headers = {h["name"]: h["value"] for h in entry["request"]["headers"]}
+                    added_count = 0
+                    for name, value in extra_headers.items():
+                        if name not in existing_headers:
+                            entry["request"]["headers"].append({"name": name, "value": value})
+                            added_count += 1
+                    logger.info(f"[CdpHarRecorder] Applied {added_count} cached headers")
+            
             # Log POST requests at INFO level for debugging
             method = request.get('method', 'GET')
             entry_method = entry["request"]["method"]
@@ -203,24 +219,37 @@ class CdpHarRecorder:
         This event contains the complete headers including browser-added headers
         like Accept, Sec-Fetch-Dest, Sec-Fetch-Mode, Sec-Fetch-User, etc.
         These headers are needed for proper navigation event detection.
+        
+        NOTE: This event may arrive BEFORE or AFTER requestWillBeSent for the same request.
+        We cache it if it arrives early.
         """
         try:
             request_id = event.get("requestId")
-            if not request_id or request_id not in self._pending_requests:
+            extra_headers = event.get("headers", {})
+            
+            logger.info(f"[CdpHarRecorder] requestWillBeSentExtraInfo: requestId={request_id}, headers={len(extra_headers)}")
+            
+            if not request_id:
                 return
             
-            entry = self._pending_requests[request_id]
-            
-            # Get the extra headers from this event
-            extra_headers = event.get("headers", {})
-            if extra_headers:
-                # Merge extra headers into existing headers
-                existing_headers = {h["name"]: h["value"] for h in entry["request"]["headers"]}
-                
-                # Add new headers (extra_headers has case-preserved keys)
-                for name, value in extra_headers.items():
-                    if name not in existing_headers:
-                        entry["request"]["headers"].append({"name": name, "value": value})
+            # Check if the main request has already been registered
+            if request_id in self._pending_requests:
+                # Request already exists, merge headers now
+                entry = self._pending_requests[request_id]
+                if extra_headers:
+                    logger.info(f"[CdpHarRecorder] Merging {len(extra_headers)} extra headers for {entry['request']['url'][:80]}")
+                    existing_headers = {h["name"]: h["value"] for h in entry["request"]["headers"]}
+                    
+                    added_count = 0
+                    for name, value in extra_headers.items():
+                        if name not in existing_headers:
+                            entry["request"]["headers"].append({"name": name, "value": value})
+                            added_count += 1
+                    logger.info(f"[CdpHarRecorder] Added {added_count} new headers")
+            else:
+                # Request hasn't arrived yet, cache the extra info
+                logger.info(f"[CdpHarRecorder] Caching extraInfo for future request {request_id}")
+                self._pending_extra_info[request_id] = {"headers": extra_headers}
                         
         except Exception as e:
             logger.warning(f"[CdpHarRecorder] Error handling requestWillBeSentExtraInfo: {e}")
