@@ -272,10 +272,69 @@ class TestRaceCondition:
         assert "req-fast-302" not in recorder._pending_requests
         assert any(e["_requestId"] == "req-fast-302" for e in recorder._entries)
 
-        # Wait for the slow fetch to complete — should not crash
+        # Wait for the slow fetch to complete — should late-patch the entry
         await asyncio.sleep(0.15)
 
-        # No exception raised = success
+        # Verify postData was actually written (late-patch into _entries)
+        patched = [e for e in recorder._entries if e["_requestId"] == "req-fast-302"]
+        assert len(patched) == 1
+        assert "postData" in patched[0]["request"]
+        assert patched[0]["request"]["postData"]["text"] == "too_late=yes"
+
+    @pytest.mark.asyncio
+    async def test_stop_awaits_pending_fetches(self, tmp_har_path, mock_cdp_client):
+        """stop() should await in-flight fetch tasks before saving HAR."""
+        recorder = CdpHarRecorder(har_path=tmp_har_path)
+        await recorder.start(mock_cdp_client)
+
+        # Make getRequestPostData slow (simulates network delay)
+        async def slow_fetch(**kwargs):
+            await asyncio.sleep(0.1)
+            return {"postData": "body=slow_but_captured"}
+
+        mock_cdp_client.send.Network.getRequestPostData = AsyncMock(side_effect=slow_fetch)
+
+        # Navigation POST
+        recorder._on_request_will_be_sent(
+            make_request_event("req-slow", "POST",
+                             "http://reddit.test/f/test/1/-/edit", post_data=None),
+            session_id="sess-1",
+        )
+
+        # stop() immediately — should wait for the fetch task
+        await recorder.stop()
+
+        # Verify HAR has the postData (stop waited for the fetch)
+        har = json.loads(tmp_har_path.read_text())
+        post_entries = [e for e in har["log"]["entries"] if e["request"]["method"] == "POST"]
+        assert len(post_entries) == 1
+        assert "postData" in post_entries[0]["request"]
+        assert post_entries[0]["request"]["postData"]["text"] == "body=slow_but_captured"
+
+    @pytest.mark.asyncio
+    async def test_content_type_case_insensitive(self, started_recorder, mock_cdp_client):
+        """Content-Type header matching should be case-insensitive."""
+        recorder = started_recorder
+
+        mock_cdp_client.send.Network.getRequestPostData = AsyncMock(return_value={
+            "postData": '{"key": "value"}'
+        })
+
+        # CDP may return lowercase header names
+        event = make_request_event(
+            request_id="req-json",
+            method="POST",
+            url="http://reddit.test/api/json-endpoint",
+            post_data=None,
+            headers={"content-type": "application/json"},  # lowercase
+        )
+
+        recorder._on_request_will_be_sent(event, session_id="sess-1")
+        await asyncio.sleep(0.05)
+
+        entry = recorder._pending_requests.get("req-json")
+        assert entry is not None
+        assert entry["request"]["postData"]["mimeType"] == "application/json"
 
 
 # ---------------------------------------------------------------------------
