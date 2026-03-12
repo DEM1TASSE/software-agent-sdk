@@ -9,6 +9,7 @@ this approach listens to network events on the ACTUAL browser context where
 the agent operates.
 """
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -124,7 +125,53 @@ class CdpHarRecorder:
                 logger.info(f"[CdpHarRecorder] Network enabled for session {session_id[:8]}...")
         except Exception as e:
             logger.debug(f"[CdpHarRecorder] Failed to enable Network for session {session_id[:8]}...: {e}")
-    
+
+    async def _fetch_post_data(self, request_id: str, session_id: str | None) -> None:
+        """Actively fetch POST body via Network.getRequestPostData.
+
+        For navigation POSTs (form submit → 302 redirect), Chrome omits postData
+        from the requestWillBeSent event. This method retrieves it before the
+        request is cleaned up by Chrome.
+
+        Silently handles failures (e.g., request already completed/redirected).
+        """
+        try:
+            if not self._cdp_client:
+                return
+            result = await self._cdp_client.send.Network.getRequestPostData(
+                params={"requestId": request_id},
+                session_id=session_id,
+            )
+            fetched_data = result.get("postData", "")
+            if not fetched_data:
+                return
+            # Write back to pending entry if it still exists
+            if request_id in self._pending_requests:
+                entry = self._pending_requests[request_id]
+                content_type = "application/x-www-form-urlencoded"
+                # Try to get Content-Type from existing headers
+                for h in entry["request"].get("headers", []):
+                    if h["name"] == "Content-Type":
+                        content_type = h["value"]
+                        break
+                entry["request"]["postData"] = {
+                    "mimeType": content_type,
+                    "text": fetched_data,
+                }
+                logger.info(f"[CdpHarRecorder] Fetched postData ({len(fetched_data)} chars) for {entry['request']['url'][:100]}")
+            else:
+                # Entry already moved to _entries (fast 302). Try to patch it there.
+                for entry in self._entries:
+                    if entry.get("_requestId") == request_id:
+                        entry["request"]["postData"] = {
+                            "mimeType": "application/x-www-form-urlencoded",
+                            "text": fetched_data,
+                        }
+                        logger.info(f"[CdpHarRecorder] Late-patched postData for completed request {request_id}")
+                        break
+        except Exception as e:
+            logger.debug(f"[CdpHarRecorder] getRequestPostData failed for {request_id}: {e}")
+
     def _on_request_will_be_sent(self, event: dict[str, Any], session_id: Optional[str] = None) -> None:
         """Handle Network.requestWillBeSent event."""
         try:
@@ -179,14 +226,21 @@ class CdpHarRecorder:
             }
             
             # Add POST data if present
+            method = request.get("method", "GET")
             post_data = request.get("postData")
             if post_data:
                 entry["request"]["postData"] = {
                     "mimeType": request.get("headers", {}).get("Content-Type", "application/x-www-form-urlencoded"),
                     "text": post_data,
                 }
-            
+
             self._pending_requests[request_id] = entry
+
+            # For navigation POSTs (form submit → 302), Chrome omits postData
+            # in requestWillBeSent. Actively fetch it via getRequestPostData.
+            if method == "POST" and not post_data:
+                logger.info(f"[CdpHarRecorder] POST without postData, fetching via getRequestPostData: {request.get('url', '')[:100]}")
+                asyncio.create_task(self._fetch_post_data(request_id, session_id))
             
             # Check if we have cached extraInfo that arrived early
             if request_id in self._pending_extra_info:
@@ -203,10 +257,8 @@ class CdpHarRecorder:
                     logger.info(f"[CdpHarRecorder] Applied {added_count} cached headers")
             
             # Log POST requests at INFO level for debugging
-            method = request.get('method', 'GET')
-            entry_method = entry["request"]["method"]
             if method != 'GET':
-                logger.info(f"[CdpHarRecorder] Non-GET request: {method} (entry_method={entry_method}) {request.get('url', '')[:100]}")
+                logger.info(f"[CdpHarRecorder] Non-GET request: {method} {request.get('url', '')[:100]}")
             else:
                 logger.debug(f"[CdpHarRecorder] Request: {method} {request.get('url', '')[:80]}")
             
