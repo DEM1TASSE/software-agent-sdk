@@ -9,7 +9,6 @@ this approach listens to network events on the ACTUAL browser context where
 the agent operates.
 """
 
-import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -42,8 +41,6 @@ class CdpHarRecorder:
         self._pending_requests: dict[str, dict[str, Any]] = {}
         # Cache for extraInfo that arrives before requestWillBeSent
         self._pending_extra_info: dict[str, dict[str, Any]] = {}
-        # Track in-flight getRequestPostData tasks so stop() can await them
-        self._pending_fetch_tasks: set[asyncio.Task] = set()
     
     async def start(self, cdp_client: Any, browser_session: Any = None, session_id: Optional[str] = None) -> None:
         """Start recording network traffic via CDP.
@@ -127,60 +124,7 @@ class CdpHarRecorder:
                 logger.info(f"[CdpHarRecorder] Network enabled for session {session_id[:8]}...")
         except Exception as e:
             logger.debug(f"[CdpHarRecorder] Failed to enable Network for session {session_id[:8]}...: {e}")
-
-    @staticmethod
-    def _get_content_type(entry: dict[str, Any]) -> str:
-        """Extract Content-Type from an entry's request headers (case-insensitive)."""
-        for h in entry.get("request", {}).get("headers", []):
-            if h["name"].lower() == "content-type":
-                return h["value"]
-        return "application/x-www-form-urlencoded"
-
-    def _patch_post_data(self, entry: dict[str, Any], fetched_data: str) -> None:
-        """Write fetched postData into a HAR entry."""
-        entry["request"]["postData"] = {
-            "mimeType": self._get_content_type(entry),
-            "text": fetched_data,
-        }
-
-    async def _fetch_post_data(self, request_id: str, session_id: str | None) -> None:
-        """Actively fetch POST body via Network.getRequestPostData.
-
-        For navigation POSTs (form submit → 302 redirect), Chrome omits postData
-        from the requestWillBeSent event. This method retrieves it before the
-        request is cleaned up by Chrome.
-
-        NOTE: Callbacks are dispatched from the asyncio event loop thread
-        (same as _on_target_attached which uses the same create_task pattern),
-        so asyncio.create_task is safe here.
-
-        Silently handles failures (e.g., request already completed/redirected).
-        """
-        try:
-            if not self._cdp_client:
-                return
-            result = await self._cdp_client.send.Network.getRequestPostData(
-                params={"requestId": request_id},
-                session_id=session_id,
-            )
-            fetched_data = result.get("postData", "")
-            if not fetched_data:
-                return
-            # Write back to pending entry if it still exists
-            if request_id in self._pending_requests:
-                entry = self._pending_requests[request_id]
-                self._patch_post_data(entry, fetched_data)
-                logger.info(f"[CdpHarRecorder] Fetched postData ({len(fetched_data)} chars) for {entry['request']['url'][:100]}")
-            else:
-                # Entry already moved to _entries (fast 302). Try to patch it there.
-                for entry in self._entries:
-                    if entry.get("_requestId") == request_id:
-                        self._patch_post_data(entry, fetched_data)
-                        logger.info(f"[CdpHarRecorder] Late-patched postData for completed request {request_id}")
-                        break
-        except Exception as e:
-            logger.debug(f"[CdpHarRecorder] getRequestPostData failed for {request_id}: {e}")
-
+    
     def _on_request_will_be_sent(self, event: dict[str, Any], session_id: Optional[str] = None) -> None:
         """Handle Network.requestWillBeSent event."""
         try:
@@ -196,7 +140,30 @@ class CdpHarRecorder:
                 started_dt = datetime.fromtimestamp(wall_time, tz=timezone.utc)
             else:
                 started_dt = datetime.now(timezone.utc)
-            
+
+            # Handle redirect: Chrome reuses requestId for redirects and sends
+            # the previous response in redirectResponse. Save the original entry
+            # (which has the POST postData) before it gets overwritten.
+            redirect_response = event.get("redirectResponse")
+            if redirect_response and request_id in self._pending_requests:
+                redirect_entry = self._pending_requests.pop(request_id)
+
+                redirect_entry["response"]["status"] = redirect_response.get("status", 0)
+                redirect_entry["response"]["statusText"] = redirect_response.get("statusText", "")
+                redirect_entry["response"]["headers"] = self._format_headers(redirect_response.get("headers", {}))
+                redirect_entry["response"]["content"]["mimeType"] = redirect_response.get("mimeType", "")
+                redirect_entry["response"]["redirectURL"] = request.get("url", "")
+
+                timing = redirect_response.get("timing")
+                if timing:
+                    redirect_entry["timings"]["wait"] = timing.get("receiveHeadersEnd", 0) - timing.get("sendEnd", 0)
+
+                self._entries.append(redirect_entry)
+
+                prev_method = redirect_entry["request"]["method"]
+                if prev_method != "GET":
+                    logger.info(f"[CdpHarRecorder] Redirect {prev_method} saved: {redirect_entry['request']['url'][:80]} -> {request.get('url', '')[:80]}")
+
             # Build request entry
             entry = {
                 "startedDateTime": started_dt.isoformat(),
@@ -235,25 +202,14 @@ class CdpHarRecorder:
             }
             
             # Add POST data if present
-            method = request.get("method", "GET")
             post_data = request.get("postData")
             if post_data:
                 entry["request"]["postData"] = {
                     "mimeType": request.get("headers", {}).get("Content-Type", "application/x-www-form-urlencoded"),
                     "text": post_data,
                 }
-
+            
             self._pending_requests[request_id] = entry
-
-            # For navigation POSTs (form submit → 302), Chrome omits postData
-            # in requestWillBeSent. Actively fetch it via getRequestPostData.
-            # NOTE: This callback runs in the asyncio event loop thread (same
-            # assumption as _on_target_attached line 114), so create_task is safe.
-            if method == "POST" and not post_data:
-                logger.info(f"[CdpHarRecorder] POST without postData, fetching via getRequestPostData: {request.get('url', '')[:100]}")
-                task = asyncio.create_task(self._fetch_post_data(request_id, session_id))
-                self._pending_fetch_tasks.add(task)
-                task.add_done_callback(self._pending_fetch_tasks.discard)
             
             # Check if we have cached extraInfo that arrived early
             if request_id in self._pending_extra_info:
@@ -270,8 +226,10 @@ class CdpHarRecorder:
                     logger.info(f"[CdpHarRecorder] Applied {added_count} cached headers")
             
             # Log POST requests at INFO level for debugging
+            method = request.get('method', 'GET')
+            entry_method = entry["request"]["method"]
             if method != 'GET':
-                logger.info(f"[CdpHarRecorder] Non-GET request: {method} {request.get('url', '')[:100]}")
+                logger.info(f"[CdpHarRecorder] Non-GET request: {method} (entry_method={entry_method}) {request.get('url', '')[:100]}")
             else:
                 logger.debug(f"[CdpHarRecorder] Request: {method} {request.get('url', '')[:80]}")
             
@@ -428,14 +386,7 @@ class CdpHarRecorder:
                     await self._cdp_client.send.Network.disable(session_id=self._session_id)
                 except Exception:
                     pass  # Best effort
-
-            # Wait for any in-flight getRequestPostData fetches to complete
-            # so their postData is written before we save the HAR file.
-            if self._pending_fetch_tasks:
-                logger.info(f"[CdpHarRecorder] Waiting for {len(self._pending_fetch_tasks)} pending postData fetches...")
-                await asyncio.gather(*self._pending_fetch_tasks, return_exceptions=True)
-                self._pending_fetch_tasks.clear()
-
+            
             # Move any remaining pending requests to entries
             pending_count = len(self._pending_requests)
             if pending_count > 0:
